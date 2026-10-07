@@ -54,8 +54,12 @@ const (
 	MemberJoined MemberState = iota
 	// MemberDisconnected is offline within the retention window.
 	MemberDisconnected
-	// MemberLeft has permanently left the session.
+	// MemberLeft has permanently left the session; the vacated slot is still
+	// an unhandled vacancy (awaiting backfill or already ended the session).
 	MemberLeft
+	// MemberReplaced left and the vacated slot was filled by a backfill
+	// replacement team. Terminal: no longer counts as a vacancy.
+	MemberReplaced
 )
 
 // Member is a player participating in a relay session.
@@ -89,6 +93,7 @@ type Session struct {
 	Members          []Member
 	CreatedTick      int64
 	EndedTick        int64
+	EndReason        string // machine-distinguishable end cause, set when State becomes SessionEnded
 	MatchID          string
 	Backfill         bool   // true if the session was created via backfill
 	BackfillTicketID string // active backfill ticket, if any

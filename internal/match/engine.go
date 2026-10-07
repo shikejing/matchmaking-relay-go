@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shikejing/matchmaking-relay-go/internal/audit"
@@ -45,16 +46,23 @@ type QueueView struct {
 // Engine runs deterministic, per-partition matching. Each partition is owned
 // by a single goroutine (the background loop) or driven by manual Tick calls;
 // match decisions never read maps, clocks, or random sources.
+//
+// Locking: the partitions map is immutable after construction. teamIndex is
+// guarded by indexMu, matchSeq is atomic, and each partitionState has its own
+// mutex. A partition mutex is never held while acquiring indexMu (team-index
+// updates happen before or after the partition critical section), so no lock
+// ordering cycle exists and partitions can never deadlock each other.
 type Engine struct {
 	cfg   config.Config
 	rules *rule.Registry
 	audit *audit.Log
 	relay *relay.Manager
 
-	mu         sync.Mutex
+	indexMu   sync.Mutex
+	teamIndex map[model.TeamID]model.PartitionID
+
 	partitions map[model.PartitionID]*partitionState
-	teamIndex  map[model.TeamID]model.PartitionID
-	matchSeq   int64
+	matchSeq   atomic.Int64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -117,24 +125,31 @@ func (e *Engine) Enqueue(req EnqueueRequest) (*model.Team, error) {
 		return nil, rejectTeam(RejectRuleNotFound, err.Error(), req.TeamID)
 	}
 
-	// Lock order: engine.mu then partition.mu.
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	pstate.mu.Lock()
-	defer pstate.mu.Unlock()
-
+	// Claim the team id atomically first; the partition queue insert happens
+	// afterwards. The two locks are never held at the same time.
+	e.indexMu.Lock()
 	if _, exists := e.teamIndex[req.TeamID]; exists {
+		e.indexMu.Unlock()
 		return nil, rejectTeam(RejectDuplicateTeam, "team already enqueued or matched; duplicate submission is ignored", req.TeamID)
 	}
+	e.teamIndex[req.TeamID] = req.Partition
+	e.indexMu.Unlock()
+
+	pstate.mu.Lock()
 	if len(pstate.teams) >= e.cfg.QueueCapacity {
+		queueSize := len(pstate.teams)
+		pstate.mu.Unlock()
+		e.indexMu.Lock()
+		delete(e.teamIndex, req.TeamID)
+		e.indexMu.Unlock()
 		e.audit.Append(audit.Record{
 			Type:      audit.EventReject,
 			Partition: req.Partition,
 			TeamID:    req.TeamID,
 			Reason:    string(RejectQueueFull),
-			Input:     mustJSON(map[string]any{"queueSize": len(pstate.teams), "capacity": e.cfg.QueueCapacity}),
+			Input:     mustJSON(map[string]any{"queueSize": queueSize, "capacity": e.cfg.QueueCapacity}),
 		})
-		return nil, rejectTeam(RejectQueueFull, fmt.Sprintf("partition %q queue is full (%d/%d)", req.Partition, len(pstate.teams), e.cfg.QueueCapacity), req.TeamID)
+		return nil, rejectTeam(RejectQueueFull, fmt.Sprintf("partition %q queue is full (%d/%d)", req.Partition, queueSize, e.cfg.QueueCapacity), req.TeamID)
 	}
 
 	players := make([]model.Player, len(req.Players))
@@ -151,8 +166,9 @@ func (e *Engine) Enqueue(req EnqueueRequest) (*model.Team, error) {
 	}
 	pstate.seq++
 	pstate.teams[req.TeamID] = team
-	e.teamIndex[req.TeamID] = req.Partition
-
+	// The audit record is appended inside the partition critical section so
+	// the audited enqueue order always matches EnqueueSeq assignment order
+	// (the determinism-replay contract depends on this).
 	e.audit.Append(audit.Record{
 		Type:        audit.EventEnqueue,
 		Partition:   req.Partition,
@@ -167,29 +183,31 @@ func (e *Engine) Enqueue(req EnqueueRequest) (*model.Team, error) {
 		}),
 		Decision: fmt.Sprintf("score merged by rule v%d; enqueueSeq=%d", ruleVersion, team.EnqueueSeq),
 	})
+	pstate.mu.Unlock()
 	return team, nil
 }
 
 // Cancel removes a waiting team before it is matched.
 func (e *Engine) Cancel(teamID model.TeamID) error {
-	e.mu.Lock()
+	e.indexMu.Lock()
 	pid, ok := e.teamIndex[teamID]
-	e.mu.Unlock()
+	e.indexMu.Unlock()
 	if !ok {
 		return rejectTeam(RejectTeamNotWaiting, "team is not enqueued", teamID)
 	}
 	pstate := e.partitions[pid]
 	pstate.mu.Lock()
-	defer pstate.mu.Unlock()
 	team, ok := pstate.teams[teamID]
 	if !ok || team.Status != model.TeamWaiting {
+		pstate.mu.Unlock()
 		return rejectTeam(RejectTeamNotWaiting, "team is not waiting (already matched or cancelled)", teamID)
 	}
 	team.Status = model.TeamCancelled
 	delete(pstate.teams, teamID)
-	e.mu.Lock()
+	pstate.mu.Unlock()
+	e.indexMu.Lock()
 	delete(e.teamIndex, teamID)
-	e.mu.Unlock()
+	e.indexMu.Unlock()
 	e.audit.Append(audit.Record{
 		Type:      audit.EventCancel,
 		Partition: pid,
@@ -210,31 +228,59 @@ func (e *Engine) Tick() {
 
 func (e *Engine) tickPartition(pid model.PartitionID) {
 	pstate := e.partitions[pid]
+	removed := e.tickPartitionLocked(pstate)
+	if len(removed) > 0 {
+		e.indexMu.Lock()
+		for _, id := range removed {
+			delete(e.teamIndex, id)
+		}
+		e.indexMu.Unlock()
+	}
+}
+
+// tickPartitionLocked advances one partition by one logical step and returns
+// the ids of teams that left the queue (matched or backfilled), for deferred
+// team-index cleanup outside the partition critical section.
+func (e *Engine) tickPartitionLocked(pstate *partitionState) []model.TeamID {
 	pstate.mu.Lock()
 	defer pstate.mu.Unlock()
 	pstate.tick++
 	tick := pstate.tick
+	removed := make([]model.TeamID, 0)
 
 	// 1. Relay-side timeouts (retention / backfill expirations) for this
 	//    partition only.
 	backfillReqs := e.relay.TickPartition(pstate.id, tick)
 	for _, req := range backfillReqs {
-		e.openBackfill(pstate, req.SessionID, req.Slots, tick)
+		e.openBackfill(pstate, req, tick)
 	}
 
-	// 2. Expire backfill tickets that found no replacement in time.
+	// 2. Expire backfill tickets. A ticket is dropped when its session no
+	//    longer waits on it (ended or already served); it times out when the
+	//    wait exceeds the timeout of the rule version the session was created
+	//    under — never the current default rule.
 	for id, ticket := range pstate.backfills {
+		view, ok := e.relay.GetSession(ticket.SessionID)
+		if !ok || view.State != model.SessionActive || view.BackfillTicketID != ticket.ID {
+			// Stale ticket: the session ended or moved on without it.
+			delete(pstate.backfills, id)
+			continue
+		}
 		ruleInst, err := e.rules.Get(ticket.RuleVersion)
 		if err != nil {
 			continue
 		}
 		if tick-ticket.EnqueueTick > int64(ruleInst.BackfillTimeoutTicks()) {
-			if err := e.relay.EndSession(ticket.SessionID, tick, string(RejectBackfillTimeout)); err == nil {
+			reason := fmt.Sprintf("%s: no replacement within %d ticks (rule v%d)",
+				relay.EndCodeBackfillTimeout, ruleInst.BackfillTimeoutTicks(), ruleInst.Version())
+			if err := e.relay.EndSession(ticket.SessionID, tick, reason); err == nil {
 				e.audit.Append(audit.Record{
-					Type:      audit.EventBackfillTimeout,
-					Partition: pid,
-					SessionID: ticket.SessionID,
-					Reason:    fmt.Sprintf("no replacement within %d ticks", ruleInst.BackfillTimeoutTicks()),
+					Type:        audit.EventBackfillTimeout,
+					Partition:   pstate.id,
+					SessionID:   ticket.SessionID,
+					RuleVersion: ticket.RuleVersion,
+					Reason:      reason,
+					Input:       mustJSON(map[string]any{"ticketID": ticket.ID, "enqueueTick": ticket.EnqueueTick, "timeoutTick": tick}),
 				})
 			}
 			delete(pstate.backfills, id)
@@ -252,28 +298,34 @@ func (e *Engine) tickPartition(pid model.PartitionID) {
 			waiting = append(waiting, t)
 		}
 		for _, planned := range PlanBackfill(tickets, waiting) {
-			if err := e.relay.CompleteBackfill(planned.Ticket.SessionID, planned.Ticket.ID, planned.Team, tick); err != nil {
+			followUps, err := e.relay.CompleteBackfill(planned.Ticket.SessionID, planned.Ticket.ID, planned.Team, tick)
+			if err != nil {
 				// Session may have ended concurrently; drop the ticket.
 				delete(pstate.backfills, planned.Ticket.ID)
 				continue
 			}
-			e.removeWaiting(pstate, planned.Team)
+			delete(pstate.teams, planned.Team.ID)
+			removed = append(removed, planned.Team.ID)
 			delete(pstate.backfills, planned.Ticket.ID)
 			e.audit.Append(audit.Record{
 				Type:        audit.EventBackfillSucceeded,
-				Partition:   pid,
+				Partition:   pstate.id,
 				SessionID:   planned.Ticket.SessionID,
 				TeamID:      planned.Team.ID,
 				RuleVersion: planned.Team.RuleVersion,
-				Input:       mustJSON(map[string]any{"slots": planned.Ticket.Slots, "teamSize": len(planned.Team.Members)}),
+				Input:       mustJSON(map[string]any{"ticketID": planned.Ticket.ID, "slots": planned.Ticket.Slots, "teamSize": len(planned.Team.Members)}),
 				Decision:    "backfill ticket served by earliest matching team",
 			})
+			// Slots vacated while the ticket was pending get a fresh ticket.
+			for _, req := range followUps {
+				e.openBackfill(pstate, req, tick)
+			}
 		}
 	}
 
 	// 4. Regular deterministic matching.
 	if len(pstate.teams) < e.cfg.TeamsPerMatch {
-		return
+		return removed
 	}
 	waiting := make([]*model.Team, 0, len(pstate.teams))
 	for _, t := range pstate.teams {
@@ -282,13 +334,13 @@ func (e *Engine) tickPartition(pid model.PartitionID) {
 	matches := PlanMatches(waiting, tick, e.rules, e.cfg.TeamsPerMatch, e.cfg.MatchBatchSize)
 	for _, m := range matches {
 		matchID := e.nextMatchID()
-		view, err := e.relay.CreateSession(pid, matchID, m.RuleVersion, m.Teams, tick)
+		view, err := e.relay.CreateSession(pstate.id, matchID, m.RuleVersion, m.Teams, tick)
 		if err != nil {
 			// At session capacity or otherwise unable: leave teams queued and
 			// stop this tick's batch; they will be retried next tick.
 			e.audit.Append(audit.Record{
 				Type:      audit.EventReject,
-				Partition: pid,
+				Partition: pstate.id,
 				Reason:    string(RejectSessionAtCapacity),
 				Input:     mustJSON(map[string]any{"matchID": matchID, "teamIDs": teamIDs(m.Teams)}),
 			})
@@ -298,11 +350,12 @@ func (e *Engine) tickPartition(pid model.PartitionID) {
 			t.Status = model.TeamMatched
 			t.MatchedTick = tick
 			t.SessionID = view.ID
-			e.removeWaiting(pstate, t)
+			delete(pstate.teams, t.ID)
+			removed = append(removed, t.ID)
 		}
 		e.audit.Append(audit.Record{
 			Type:        audit.EventMatchFormed,
-			Partition:   pid,
+			Partition:   pstate.id,
 			SessionID:   view.ID,
 			RuleVersion: m.RuleVersion,
 			Input: mustJSON(map[string]any{
@@ -318,58 +371,52 @@ func (e *Engine) tickPartition(pid model.PartitionID) {
 				m.Teams[0].EnqueueSeq, m.ScoreDiff, m.WaitTicks),
 		})
 	}
+	return removed
 }
 
 // OpenBackfill queues a backfill ticket for a session that vacated slots
 // outside the normal tick flow (e.g. an explicit member leave).
-func (e *Engine) OpenBackfill(partition model.PartitionID, sessionID model.SessionID, slots int, tick int64) {
-	pstate, ok := e.partitions[partition]
+func (e *Engine) OpenBackfill(req relay.BackfillRequest, tick int64) {
+	pstate, ok := e.partitions[req.Partition]
 	if !ok {
 		return
 	}
 	pstate.mu.Lock()
 	defer pstate.mu.Unlock()
-	e.openBackfill(pstate, sessionID, slots, tick)
+	e.openBackfill(pstate, req, tick)
 }
 
-func (e *Engine) openBackfill(pstate *partitionState, sessionID model.SessionID, slots int, tick int64) {
-	// One active ticket per session.
+func (e *Engine) openBackfill(pstate *partitionState, req relay.BackfillRequest, tick int64) {
+	// One active ticket per session; duplicate requests (e.g. repeated ticks)
+	// for the same wait are ignored.
 	for _, t := range pstate.backfills {
-		if t.SessionID == sessionID {
+		if t.SessionID == req.SessionID || t.ID == req.TicketID {
 			return
 		}
 	}
 	pstate.backfillSeq++
 	ticket := &model.BackfillTicket{
-		ID:          fmt.Sprintf("bf-%d-%d", pstate.tick, pstate.backfillSeq),
-		SessionID:   sessionID,
+		ID:          req.TicketID,
+		SessionID:   req.SessionID,
 		Partition:   pstate.id,
-		Slots:       slots,
+		Slots:       req.Slots,
 		EnqueueSeq:  pstate.backfillSeq,
 		EnqueueTick: tick,
+		RuleVersion: req.RuleVersion,
 	}
 	pstate.backfills[ticket.ID] = ticket
 	e.audit.Append(audit.Record{
-		Type:      audit.EventBackfillStarted,
-		Partition: pstate.id,
-		SessionID: sessionID,
-		Input:     mustJSON(map[string]any{"slots": slots, "enqueueTick": tick}),
-		Decision:  "retention window expired under backfill-enabled rule",
+		Type:        audit.EventBackfillStarted,
+		Partition:   pstate.id,
+		SessionID:   req.SessionID,
+		RuleVersion: req.RuleVersion,
+		Input:       mustJSON(map[string]any{"ticketID": req.TicketID, "slots": req.Slots, "enqueueTick": tick}),
+		Decision:    "retention window expired under backfill-enabled rule",
 	})
 }
 
-func (e *Engine) removeWaiting(pstate *partitionState, team *model.Team) {
-	delete(pstate.teams, team.ID)
-	e.mu.Lock()
-	delete(e.teamIndex, team.ID)
-	e.mu.Unlock()
-}
-
 func (e *Engine) nextMatchID() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.matchSeq++
-	return fmt.Sprintf("m-%d", e.matchSeq)
+	return fmt.Sprintf("m-%d", e.matchSeq.Add(1))
 }
 
 // Start launches one independent goroutine per partition, ticking at
@@ -411,9 +458,9 @@ func (e *Engine) Stop() {
 
 // GetTeam returns the team with the given id, if any.
 func (e *Engine) GetTeam(teamID model.TeamID) (*model.Team, bool) {
-	e.mu.Lock()
+	e.indexMu.Lock()
 	pid, ok := e.teamIndex[teamID]
-	e.mu.Unlock()
+	e.indexMu.Unlock()
 	if !ok {
 		return nil, false
 	}
@@ -460,8 +507,7 @@ func (e *Engine) ListPartitions() []model.PartitionID {
 }
 
 func (e *Engine) partitionIDs() []model.PartitionID {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	// e.partitions is immutable after NewEngine, so no lock is needed.
 	out := make([]model.PartitionID, 0, len(e.partitions))
 	for pid := range e.partitions {
 		out = append(out, pid)

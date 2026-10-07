@@ -22,15 +22,38 @@ const (
 	RejectMemberAlreadyLeft      = "MEMBER_ALREADY_LEFT"
 	RejectClientSlow             = "CLIENT_SLOW"
 	RejectBackfillNotRequested   = "BACKFILL_NOT_REQUESTED"
+	RejectBackfillTicketMismatch = "BACKFILL_TICKET_MISMATCH"
 	RejectReconnectWindowExpired = "RECONNECT_WINDOW_EXPIRED"
 )
 
+// Session end-reason codes. SessionView.EndReason always starts with one of
+// these codes once the session has ended, so callers can distinguish the cause
+// without parsing free text.
+const (
+	// EndCodeBackfillTimeout: a backfill ticket waited longer than the
+	// session's rule allows without finding a replacement team.
+	EndCodeBackfillTimeout = "BACKFILL_TIMEOUT"
+	// EndCodeRetentionTimeout: a disconnected member exceeded the retention
+	// window under a rule with backfill disabled.
+	EndCodeRetentionTimeout = "RETENTION_TIMEOUT"
+	// EndCodeNoMembers: the last joined member left.
+	EndCodeNoMembers = "NO_MEMBERS_REMAIN"
+	// EndCodeExplicit: terminated by an explicit EndSession call.
+	EndCodeExplicit = "EXPLICIT_END"
+)
+
 // BackfillRequest is raised by the relay tick when a disconnected member's
-// retention window expires under a backfill-enabled rule.
+// retention window expires under a backfill-enabled rule. The ticket ID is
+// assigned by the relay manager so the session snapshot and the engine's
+// ticket always refer to the same ID. RuleVersion is the session's own rule
+// version, captured at request time, so the timeout policy follows the rule
+// the session was created under regardless of later default-rule switches.
 type BackfillRequest struct {
-	SessionID model.SessionID
-	Partition model.PartitionID
-	Slots     int
+	TicketID    string
+	SessionID   model.SessionID
+	Partition   model.PartitionID
+	Slots       int
+	RuleVersion int
 }
 
 // Manager owns all relay sessions and enforces their lifecycle transitions.
@@ -44,6 +67,7 @@ type Manager struct {
 	byPartition map[model.PartitionID][]model.SessionID
 	activeCount int
 	nextSession int64
+	nextTicket  int64
 
 	pipes map[model.SessionID]map[model.PlayerID]chan model.Message
 }
@@ -324,7 +348,7 @@ func (m *Manager) tickPartitionLocked(partition model.PartitionID, tick int64) [
 				}
 			}
 			if vacated > 0 {
-				_ = m.endSessionLocked(s.ID, tick, "retention-timeout: backfill disabled by rule v"+fmt.Sprint(ruleInst.Version()))
+				_ = m.endSessionLocked(s.ID, tick, EndCodeRetentionTimeout+": backfill disabled by rule v"+fmt.Sprint(ruleInst.Version()))
 			}
 		}
 	}
@@ -332,16 +356,23 @@ func (m *Manager) tickPartitionLocked(partition model.PartitionID, tick int64) [
 }
 
 // CompleteBackfill adds a replacement team to a session that requested
-// backfill.
-func (m *Manager) CompleteBackfill(sessionID model.SessionID, ticketID string, team *model.Team, tick int64) error {
+// backfill. The ticket ID must match the session's pending ticket, so a stale
+// ticket from an earlier wait can never complete against a new one. If
+// further slots vacated while this ticket was pending, a follow-up backfill
+// request is returned so the engine can queue the next ticket.
+func (m *Manager) CompleteBackfill(sessionID model.SessionID, ticketID string, team *model.Team, tick int64) ([]BackfillRequest, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, err := m.requireActive(sessionID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if s.BackfillTicketID == "" {
-		return fmt.Errorf("%s: session %s has no open backfill ticket", RejectBackfillNotRequested, sessionID)
+		return nil, fmt.Errorf("%s: session %s has no open backfill ticket", RejectBackfillNotRequested, sessionID)
+	}
+	if s.BackfillTicketID != ticketID {
+		return nil, fmt.Errorf("%s: session %s waits on ticket %s, not %s",
+			RejectBackfillTicketMismatch, sessionID, s.BackfillTicketID, ticketID)
 	}
 	for _, p := range team.Members {
 		s.Members = append(s.Members, model.Member{
@@ -359,7 +390,20 @@ func (m *Manager) CompleteBackfill(sessionID model.SessionID, ticketID string, t
 		})
 	}
 	s.BackfillTicketID = ""
-	return nil
+	// The replacement team fills existing vacancies: mark that many departed
+	// members as replaced so their slots are never backfilled twice.
+	toReplace := len(team.Members)
+	for i := range s.Members {
+		if toReplace == 0 {
+			break
+		}
+		if s.Members[i].State == model.MemberLeft {
+			s.Members[i].State = model.MemberReplaced
+			toReplace--
+		}
+	}
+	// Slots vacated while this ticket was pending get their own wait now.
+	return m.openBackfillIfNeeded(s, tick), nil
 }
 
 // RegisterPipe attaches an outbound message channel for a member.
@@ -441,7 +485,7 @@ func (m *Manager) afterMemberVacated(s *model.Session, tick int64, reason string
 		}
 	}
 	if joined == 0 {
-		_ = m.endSessionLocked(s.ID, tick, reason+": no joined members remain")
+		_ = m.endSessionLocked(s.ID, tick, EndCodeNoMembers+": "+reason)
 		return nil, nil
 	}
 	ruleInst, err := m.rules.Get(s.RuleVersion)
@@ -449,12 +493,16 @@ func (m *Manager) afterMemberVacated(s *model.Session, tick int64, reason string
 		return nil, err
 	}
 	if !ruleInst.BackfillEnabled() {
-		_ = m.endSessionLocked(s.ID, tick, reason+": backfill disabled by rule")
+		_ = m.endSessionLocked(s.ID, tick, EndCodeRetentionTimeout+": backfill disabled by rule ("+reason+")")
 		return nil, nil
 	}
 	return m.openBackfillIfNeeded(s, tick), nil
 }
 
+// openBackfillIfNeeded opens a backfill wait for the session's vacated slots.
+// At most one wait is ever pending per session: if a ticket is already open
+// the new vacancies are covered when the pending ticket resolves (see
+// CompleteBackfill, which re-opens a wait for any remaining vacancies).
 func (m *Manager) openBackfillIfNeeded(s *model.Session, tick int64) []BackfillRequest {
 	if s.BackfillTicketID != "" {
 		return nil
@@ -468,14 +516,23 @@ func (m *Manager) openBackfillIfNeeded(s *model.Session, tick int64) []BackfillR
 	if slots == 0 {
 		return nil
 	}
-	s.BackfillTicketID = "pending"
+	m.nextTicket++
+	ticketID := fmt.Sprintf("bf-%d", m.nextTicket)
+	s.BackfillTicketID = ticketID
 	m.audit.Append(audit.Record{
-		Type:      audit.EventBackfillStarted,
-		SessionID: s.ID,
-		Input:     fmt.Sprintf(`{"slots":%d,"tick":%d}`, slots, tick),
-		Decision:  "vacated slot(s) under backfill-enabled rule",
+		Type:        audit.EventBackfillStarted,
+		SessionID:   s.ID,
+		RuleVersion: s.RuleVersion,
+		Input:       fmt.Sprintf(`{"ticketID":%q,"slots":%d,"tick":%d}`, ticketID, slots, tick),
+		Decision:    "vacated slot(s) under backfill-enabled rule",
 	})
-	return []BackfillRequest{{SessionID: s.ID, Partition: s.Partition, Slots: slots}}
+	return []BackfillRequest{{
+		TicketID:    ticketID,
+		SessionID:   s.ID,
+		Partition:   s.Partition,
+		Slots:       slots,
+		RuleVersion: s.RuleVersion,
+	}}
 }
 
 func (m *Manager) endSessionLocked(sessionID model.SessionID, tick int64, reason string) error {
@@ -488,6 +545,10 @@ func (m *Manager) endSessionLocked(sessionID model.SessionID, tick int64, reason
 	}
 	s.State = model.SessionEnded
 	s.EndedTick = tick
+	s.EndReason = reason
+	// A ended session never has a pending backfill wait; clear it so the
+	// final snapshot is self-consistent (ended => no vacancy still waiting).
+	s.BackfillTicketID = ""
 	m.activeCount--
 	for _, ch := range m.pipes[sessionID] {
 		close(ch)
@@ -498,6 +559,7 @@ func (m *Manager) endSessionLocked(sessionID model.SessionID, tick int64, reason
 		Partition:   s.Partition,
 		SessionID:   sessionID,
 		RuleVersion: s.RuleVersion,
+		Reason:      reason,
 		Input:       fmt.Sprintf(`{"endedTick":%d,"reason":%q,"messages":%d}`, tick, reason, s.MessageCount),
 		Decision:    reason,
 	})

@@ -25,6 +25,7 @@ type SessionView struct {
 	Members          []MemberView
 	CreatedTick      int64
 	EndedTick        int64
+	EndReason        string // why the session ended; empty while active
 	MatchID          string
 	Backfill         bool
 	BackfillTicketID string
@@ -59,6 +60,7 @@ func toSessionView(s *model.Session) SessionView {
 		Members:          members,
 		CreatedTick:      s.CreatedTick,
 		EndedTick:        s.EndedTick,
+		EndReason:        s.EndReason,
 		MatchID:          s.MatchID,
 		Backfill:         s.Backfill,
 		BackfillTicketID: s.BackfillTicketID,

@@ -86,27 +86,49 @@ SessionActive ──成员离线──▶ MemberDisconnected ──窗口内重�
 
 ### 补位（backfill）
 
-- v2 规则下，空位以补位票（backfill ticket）的形式进入匹配队列，每分区每会话最多一张活跃票。
+- v2 规则下，空位以补位票（backfill ticket）的形式进入匹配队列，**每会话同一时刻最多一张未决票**；票 ID 由中继层分配，会话快照的 `BackfillTicketID` 与引擎中的票始终是同一个 ID。
 - 补位票在每个 tick 最先被满足：与**空位人数相同**的等待队伍中按入队次序最早者配对。
-- 补位票超过 `BackfillTimeoutTicks`（v2=50）仍无合适队伍时，会话结束并记录 `BACKFILL_TIMEOUT`。
-- 补位严格按分区隔离：A 分区的补位绝不消费 B 分区的队伍（测试 `TestBackfillDoesNotCrossPartitions`）。
+- 补位票超过 `BackfillTimeoutTicks`（v2=50）仍无合适队伍时，会话**必定结束**，结束原因为 `BACKFILL_TIMEOUT`，不会无限期挂在活跃状态（测试 `TestBackfillTimeoutRealTicks`：全程只推进逻辑时钟真实触发）。
+- 超时时长按**会话建立时的规则版本**执行：等待期间切换默认规则不影响该会话的超时行为（测试 `TestBackfillTimeoutAfterRuleSwitch`）。
+- 补位成功后，被顶替的成员转为 `MemberReplaced`（空位已处理的终态），**不会被重复补位**；重复推进逻辑时钟也不会产生重复票（测试 `TestBackfillSuccessThenNewVacancy`）。
+- 等待期间又有成员离开：不并行开第二张票；当前票被满足后自动为剩余空位开**跟进票**（测试 `TestBackfillFollowUpForConcurrentVacancies`）。
+- 会话因任何原因结束时，未决票立即清理，最终快照自洽（已结束 ⇒ 无未决票）；引擎侧的过期票在下一 tick 被丢弃，不会把后来的队伍喂给已结束的会话（测试 `TestBackfillTicketDroppedWhenSessionEnds`）。
+- 补位严格按分区隔离：A 分区的补位绝不消费 B 分区的队伍，某分区等待/超时也不阻塞其他分区推进（测试 `TestBackfillDoesNotCrossPartitions`、`TestBackfillPartitionsConcurrent`）。
+
+### 快照自洽与结束原因区分
+
+对外查询（`QuerySession` / `ListSessions`）拿到的始终是单个自洽快照，以下不变量在任意观测点成立：
+
+- 活跃会话：`BackfillTicketID` 非空 ⟺ 存在未处理空位（`MemberLeft`）；`EndReason` 必为空。
+- 已结束会话：`BackfillTicketID` 必为空，`EndReason` 必非空。
+
+会话结束后可通过 `SessionView.EndReason` 的前缀码区分结束原因（审计 `SESSION_ENDED` 记录的 `Reason` 字段相同）：
+
+| 前缀码 | 含义 |
+|---|---|
+| `BACKFILL_TIMEOUT` | 补位等待超过会话所属规则的时长，无合适替补 |
+| `RETENTION_TIMEOUT` | 成员掉线超保留窗口，且规则未启用补位 |
+| `NO_MEMBERS_REMAIN` | 最后一名在册成员离开 |
+| `EXPLICIT_END` | 显式调用 EndSession |
+
+补位成功 / 补位超时 / 掉线按规则结束三种结果在审计中分别对应 `BACKFILL_SUCCEEDED` / `BACKFILL_TIMEOUT` / `SESSION_ENDED(RETENTION_TIMEOUT)`，可互相区分。
 
 ## 3. 并发推进与隔离
 
-- 每个匹配分区拥有独立互斥与（后台模式下的）独立 goroutine：慢分区不阻塞快分区（测试 `TestPartitionIsolationBackground`）。
-- 所有容量均有上限且可配置：
+- 每个匹配分区拥有独立互斥与（后台模式下的）独立 goroutine：慢分区不阻塞快分区（测试 `TestPartitionIsolationBackground`）。锁设计上不存在嵌套次序环：分区锁内绝不获取队伍索引锁（索引更新在分区临界区之外完成），`matchSeq` 为原子计数，因此多分区并行推进不会死锁。
+- 所有容量均有**上下界**且可配置；启动时超出允许范围的配置被直接拒绝，返回 `*config.LimitError`（含字段名、值、允许区间，可用 `errors.As` 区分是哪一项超限）：
 
-| 配置项 | 含义 | 默认值 |
-|---|---|---|
-| `QueueCapacity` | 每分区等待队列上限 | 64 |
-| `MatchBatchSize` | 每分区每 tick 最多匹配场数 | 8 |
-| `MaxConcurrentSessions` | 全局并行会话上限 | 32 |
-| `TeamsPerMatch` | 每场匹配的队伍数 | 2 |
-| `AuditCapacity` | 审计环形日志保留条数 | 4096 |
-| `MessageBufferSize` | 每成员消息管道缓冲 | 64 |
-| `TickInterval` | 后台推进间隔；0 为手动 `Tick()`（确定性测试用） | 0 |
-| `Seed` | 确定性种子（仅记录，不参与决策） | 1 |
-| `Partitions` | 启动时创建的分区 | `["default"]` |
+| 配置项 | 含义 | 默认值 | 允许区间 |
+|---|---|---|---|
+| `QueueCapacity` | 每分区等待队列上限 | 64 | [1, 8192] |
+| `MatchBatchSize` | 每分区每 tick 最多匹配场数 | 8 | [1, 256] |
+| `MaxConcurrentSessions` | 全局并行会话上限 | 32 | [1, 4096] |
+| `TeamsPerMatch` | 每场匹配的队伍数 | 2 | ≥ 2 |
+| `AuditCapacity` | 审计环形日志保留条数 | 4096 | [1, 1048576] |
+| `MessageBufferSize` | 每成员消息管道缓冲 | 64 | [1, 4096] |
+| `TickInterval` | 后台推进间隔；0 为手动 `Tick()`（确定性测试用） | 0 | ≥ 0 |
+| `Seed` | 确定性种子（仅记录，不参与决策） | 1 | 任意 |
+| `Partitions` | 启动时创建的分区 | `["default"]` | 非空、不重复 |
 
 - 超出容量返回**可区分的拒绝结果**（`match.Error` / 审计事件码）：
 
@@ -122,9 +144,10 @@ SessionActive ──成员离线──▶ MemberDisconnected ──窗口内重�
 | `MEMBER_NOT_FOUND` / `MEMBER_NOT_DISCONNECTED` | 成员不存在 / 状态不允许该迁移 |
 | `RECONNECT_WINDOW_EXPIRED` | 重连超出保留窗口 |
 | `CLIENT_SLOW` | 消息管道缓冲满（消息丢弃并审计，中继不阻塞） |
-| `BACKFILL_TIMEOUT` | 补位超时，会话结束 |
+| `BACKFILL_TIMEOUT` | 补位超时，会话结束（同时作为会话 `EndReason` 前缀） |
+| `BACKFILL_TICKET_MISMATCH` | 用过期/他人的补位票 ID 完成补位 |
 
-- 高负载下无死锁、无内存无界增长：队列有界、审计环形有界、消息管道有界且满即跳过（测试 `TestNoDeadlockUnderLoad`、`TestQueueCapUnderBurst`、`TestAuditRingBounded`）。
+- 高负载下无死锁、无内存无界增长：队列有界、审计环形有界、消息管道有界且满即跳过（测试 `TestNoDeadlockUnderLoad`、`TestQueueCapUnderBurst`、`TestAuditRingBounded`）。配置超上界在启动期拒绝（测试 `TestConfigUpperBounds`）；运行期超限拒绝不影响后续正常请求（测试 `TestRuntimeLimitRejectionsIsolated`）。
 
 ## 4. 规则版本兼容
 
@@ -150,4 +173,4 @@ go test ./...          # 全部测试
 go test -race ./...    # 竞态检测
 ```
 
-覆盖：纯匹配裁决（等待优先、分值接近、平局打破、批量上限、输入洗牌不变性）、并发确定性重放、队伍完整性、重复/容量拒绝、会话生命周期、掉线重连（窗口内/超时）、补位流程与超时、跨分区隔离、规则版本切换、后台推进、消息中继与慢消费者、审计有界性。
+覆盖：纯匹配裁决（等待优先、分值接近、平局打破、批量上限、输入洗牌不变性）、并发确定性重放、队伍完整性、重复/容量拒绝、配置上界拒绝、会话生命周期、掉线重连（窗口内/超时）、补位流程（真实 tick 触发的超时结束、成功后再次补位、等待期间新空位的跟进票、过期票清理、规则切换后旧会话行为不变、多分区并发互不干扰）、跨分区隔离、规则版本切换、后台推进、消息中继与慢消费者、审计有界性。

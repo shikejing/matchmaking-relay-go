@@ -105,7 +105,7 @@ func (s *Service) Leave(sessionID model.SessionID, playerID model.PlayerID) erro
 		return err
 	}
 	for _, req := range reqs {
-		s.engine.OpenBackfill(req.Partition, req.SessionID, req.Slots, s.currentTick())
+		s.engine.OpenBackfill(req, s.currentTick())
 	}
 	return nil
 }

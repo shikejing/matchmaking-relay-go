@@ -6,6 +6,43 @@ import (
 	"time"
 )
 
+// Upper bounds for capacity-related settings. Every capacity knob has both a
+// lower and an upper bound: values outside the range are rejected at startup
+// with a *LimitError, so a misconfigured deployment fails fast instead of
+// growing without bound at runtime.
+const (
+	// QueueCapacityMax is the largest allowed per-partition waiting queue.
+	QueueCapacityMax = 8192
+	// MatchBatchSizeMax is the largest allowed per-tick match batch.
+	MatchBatchSizeMax = 256
+	// ConcurrentSessionsMax is the largest allowed global active-session cap.
+	ConcurrentSessionsMax = 4096
+	// AuditCapacityMax is the largest allowed audit ring buffer.
+	AuditCapacityMax = 1 << 20
+	// MessageBufferSizeMax is the largest allowed per-member pipe buffer.
+	MessageBufferSizeMax = 4096
+)
+
+// LimitError reports a capacity configuration value outside its allowed
+// range. The Field name makes the rejected setting machine-distinguishable.
+type LimitError struct {
+	Field string // configuration field name, e.g. "QueueCapacity"
+	Value int    // the rejected value
+	Min   int    // smallest allowed value (inclusive)
+	Max   int    // largest allowed value (inclusive)
+}
+
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("config: %s=%d out of allowed range [%d, %d]", e.Field, e.Value, e.Min, e.Max)
+}
+
+func checkRange(field string, value, min, max int) error {
+	if value < min || value > max {
+		return &LimitError{Field: field, Value: value, Min: min, Max: max}
+	}
+	return nil
+}
+
 // Config groups the tunable limits. All limits are enforced and have upper
 // bounds so the system cannot grow without bound under high load.
 type Config struct {
@@ -61,25 +98,27 @@ func Default() Config {
 	}
 }
 
-// Validate checks the configuration for impossible limits.
+// Validate checks the configuration for impossible limits. Capacity fields
+// must be within [1, *Max]; violations return a *LimitError identifying the
+// exact field, so callers can distinguish which limit was exceeded.
 func (c Config) Validate() error {
-	if c.QueueCapacity <= 0 {
-		return fmt.Errorf("config: QueueCapacity must be > 0, got %d", c.QueueCapacity)
+	if err := checkRange("QueueCapacity", c.QueueCapacity, 1, QueueCapacityMax); err != nil {
+		return err
 	}
-	if c.MatchBatchSize <= 0 {
-		return fmt.Errorf("config: MatchBatchSize must be > 0, got %d", c.MatchBatchSize)
+	if err := checkRange("MatchBatchSize", c.MatchBatchSize, 1, MatchBatchSizeMax); err != nil {
+		return err
 	}
-	if c.MaxConcurrentSessions <= 0 {
-		return fmt.Errorf("config: MaxConcurrentSessions must be > 0, got %d", c.MaxConcurrentSessions)
+	if err := checkRange("MaxConcurrentSessions", c.MaxConcurrentSessions, 1, ConcurrentSessionsMax); err != nil {
+		return err
+	}
+	if err := checkRange("AuditCapacity", c.AuditCapacity, 1, AuditCapacityMax); err != nil {
+		return err
+	}
+	if err := checkRange("MessageBufferSize", c.MessageBufferSize, 1, MessageBufferSizeMax); err != nil {
+		return err
 	}
 	if c.TeamsPerMatch < 2 {
 		return fmt.Errorf("config: TeamsPerMatch must be >= 2, got %d", c.TeamsPerMatch)
-	}
-	if c.AuditCapacity <= 0 {
-		return fmt.Errorf("config: AuditCapacity must be > 0, got %d", c.AuditCapacity)
-	}
-	if c.MessageBufferSize <= 0 {
-		return fmt.Errorf("config: MessageBufferSize must be > 0, got %d", c.MessageBufferSize)
 	}
 	if len(c.Partitions) == 0 {
 		return fmt.Errorf("config: at least one partition is required")

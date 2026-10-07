@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/shikejing/matchmaking-relay-go/internal/config"
 	"github.com/shikejing/matchmaking-relay-go/internal/match"
 	"github.com/shikejing/matchmaking-relay-go/internal/model"
+	"github.com/shikejing/matchmaking-relay-go/internal/relay"
 	"github.com/shikejing/matchmaking-relay-go/internal/transport"
 )
 
@@ -168,6 +170,10 @@ func TestReconnectFlow(t *testing.T) {
 	got, _ = svc.QuerySession(sid)
 	if got.State != model.SessionEnded {
 		t.Fatalf("state after retention timeout = %d, want ended", got.State)
+	}
+	// The end cause must be distinguishable from a backfill timeout.
+	if !strings.HasPrefix(got.EndReason, relay.EndCodeRetentionTimeout) {
+		t.Fatalf("end reason = %q, want prefix %q", got.EndReason, relay.EndCodeRetentionTimeout)
 	}
 	if err := svc.Reconnect(sid, p1); err == nil {
 		t.Fatal("reconnect after session end should fail")
