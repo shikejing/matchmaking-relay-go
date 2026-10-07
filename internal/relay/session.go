@@ -18,13 +18,16 @@ type MemberView struct {
 // member set. External observers always read a copy taken under the manager
 // lock; they never see a half-updated session.
 type SessionView struct {
-	ID               model.SessionID
-	Partition        model.PartitionID
-	RuleVersion      int
-	State            model.SessionState
-	Members          []MemberView
-	CreatedTick      int64
-	EndedTick        int64
+	ID          model.SessionID
+	Partition   model.PartitionID
+	RuleVersion int
+	State       model.SessionState
+	Members     []MemberView
+	CreatedTick int64
+	EndedTick   int64
+	// EndReason is the machine-readable cause of termination (one of the
+	// relay.EndReason* codes), empty while the session is not ended.
+	EndReason        string
 	MatchID          string
 	Backfill         bool
 	BackfillTicketID string
@@ -59,6 +62,7 @@ func toSessionView(s *model.Session) SessionView {
 		Members:          members,
 		CreatedTick:      s.CreatedTick,
 		EndedTick:        s.EndedTick,
+		EndReason:        s.EndReason,
 		MatchID:          s.MatchID,
 		Backfill:         s.Backfill,
 		BackfillTicketID: s.BackfillTicketID,

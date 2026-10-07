@@ -6,6 +6,48 @@ import (
 	"time"
 )
 
+// Hard upper bounds for capacity-related configuration. Every capacity has
+// both a lower bound (validated in Validate) and one of these upper bounds,
+// so a misconfigured deployment is rejected at startup instead of growing
+// without bound at runtime.
+const (
+	// MaxQueueCapacity bounds Config.QueueCapacity (waiting teams per partition).
+	MaxQueueCapacity = 4096
+	// MaxMatchBatchSize bounds Config.MatchBatchSize (matches per partition per tick).
+	MaxMatchBatchSize = 256
+	// MaxConcurrentSessions bounds Config.MaxConcurrentSessions (global active sessions).
+	MaxConcurrentSessions = 4096
+	// MaxAuditCapacity bounds Config.AuditCapacity (retained audit records).
+	MaxAuditCapacity = 1 << 20
+	// MaxMessageBufferSize bounds Config.MessageBufferSize (per-member pipe buffer).
+	MaxMessageBufferSize = 4096
+)
+
+// LimitError reports a configuration limit violation. It is distinguishable
+// per field and per direction (below minimum vs. above maximum), so startup
+// failures can be matched programmatically with errors.As.
+type LimitError struct {
+	Field string // configuration field name, e.g. "QueueCapacity"
+	Value int    // the rejected value
+	Min   int    // smallest allowed value (inclusive)
+	Max   int    // largest allowed value (inclusive)
+}
+
+func (e *LimitError) Error() string {
+	if e.Value < e.Min {
+		return fmt.Sprintf("config: %s=%d is below the minimum %d", e.Field, e.Value, e.Min)
+	}
+	return fmt.Sprintf("config: %s=%d exceeds the maximum %d", e.Field, e.Value, e.Max)
+}
+
+// checkLimit returns a *LimitError unless min <= v <= max.
+func checkLimit(field string, v, min, max int) error {
+	if v < min || v > max {
+		return &LimitError{Field: field, Value: v, Min: min, Max: max}
+	}
+	return nil
+}
+
 // Config groups the tunable limits. All limits are enforced and have upper
 // bounds so the system cannot grow without bound under high load.
 type Config struct {
@@ -61,25 +103,27 @@ func Default() Config {
 	}
 }
 
-// Validate checks the configuration for impossible limits.
+// Validate checks the configuration for impossible limits. Every capacity
+// field is checked against both its lower and its hard upper bound; violations
+// are returned as *LimitError so the offending field is distinguishable.
 func (c Config) Validate() error {
-	if c.QueueCapacity <= 0 {
-		return fmt.Errorf("config: QueueCapacity must be > 0, got %d", c.QueueCapacity)
+	if err := checkLimit("QueueCapacity", c.QueueCapacity, 1, MaxQueueCapacity); err != nil {
+		return err
 	}
-	if c.MatchBatchSize <= 0 {
-		return fmt.Errorf("config: MatchBatchSize must be > 0, got %d", c.MatchBatchSize)
+	if err := checkLimit("MatchBatchSize", c.MatchBatchSize, 1, MaxMatchBatchSize); err != nil {
+		return err
 	}
-	if c.MaxConcurrentSessions <= 0 {
-		return fmt.Errorf("config: MaxConcurrentSessions must be > 0, got %d", c.MaxConcurrentSessions)
+	if err := checkLimit("MaxConcurrentSessions", c.MaxConcurrentSessions, 1, MaxConcurrentSessions); err != nil {
+		return err
+	}
+	if err := checkLimit("AuditCapacity", c.AuditCapacity, 1, MaxAuditCapacity); err != nil {
+		return err
+	}
+	if err := checkLimit("MessageBufferSize", c.MessageBufferSize, 1, MaxMessageBufferSize); err != nil {
+		return err
 	}
 	if c.TeamsPerMatch < 2 {
 		return fmt.Errorf("config: TeamsPerMatch must be >= 2, got %d", c.TeamsPerMatch)
-	}
-	if c.AuditCapacity <= 0 {
-		return fmt.Errorf("config: AuditCapacity must be > 0, got %d", c.AuditCapacity)
-	}
-	if c.MessageBufferSize <= 0 {
-		return fmt.Errorf("config: MessageBufferSize must be > 0, got %d", c.MessageBufferSize)
 	}
 	if len(c.Partitions) == 0 {
 		return fmt.Errorf("config: at least one partition is required")

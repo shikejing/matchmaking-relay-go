@@ -163,7 +163,7 @@ func TestBackfillV2(t *testing.T) {
 	}
 	// Complete backfill with a replacement team.
 	repl := mkTeam("t3", 2, "p3")
-	if err := m.CompleteBackfill(view.ID, "bf-1", repl, 300); err != nil {
+	if _, err := m.CompleteBackfill(view.ID, "bf-1", repl, 300); err != nil {
 		t.Fatalf("complete backfill: %v", err)
 	}
 	got, _ = m.GetSession(view.ID)
@@ -184,26 +184,41 @@ func TestBackfillV2(t *testing.T) {
 		t.Fatal("replacement p3 not joined after backfill")
 	}
 	// Backfill ticket is consumed; second completion fails.
-	if err := m.CompleteBackfill(view.ID, "bf-2", mkTeam("t4", 2, "p4"), 301); err == nil {
+	if _, err := m.CompleteBackfill(view.ID, "bf-2", mkTeam("t4", 2, "p4"), 301); err == nil {
 		t.Fatal("completing backfill without open ticket should fail")
 	}
 }
 
-func TestBackfillTimeoutEndsSession(t *testing.T) {
+// TestEndSessionClearsBackfillWait: ending a session that has a pending
+// backfill must produce a self-consistent terminal snapshot: ended state, an
+// end reason, and no dangling wait marker.
+func TestEndSessionClearsBackfillWait(t *testing.T) {
 	cfg := config.Default()
 	m := newTestRelay(t, cfg)
 	view := createSession(t, m, 2, 1, mkTeam("t1", 2, "p1"), mkTeam("t2", 2, "p2"))
 	if err := m.Disconnect(view.ID, "p1", 10); err != nil {
 		t.Fatal(err)
 	}
-	_ = m.Tick(10 + 201) // opens backfill
-	// Simulate engine giving up: end session with backfill-timeout reason.
-	if err := m.EndSession(view.ID, 10+201+51, "backfill-timeout"); err != nil {
-		t.Fatal(err)
+	reqs := m.Tick(10 + 201) // opens backfill
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 backfill request, got %d", len(reqs))
 	}
 	got, _ := m.GetSession(view.ID)
+	if got.BackfillTicketID == "" {
+		t.Fatal("backfill wait marker should be visible while waiting")
+	}
+	if err := m.EndSession(view.ID, 10+202, "test-end"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetSession(view.ID)
 	if got.State != model.SessionEnded {
 		t.Fatalf("state = %d, want ended", got.State)
+	}
+	if got.BackfillTicketID != "" {
+		t.Fatalf("ended session must not show a pending backfill, got %q", got.BackfillTicketID)
+	}
+	if got.EndReason != "test-end" {
+		t.Fatalf("end reason = %q, want %q", got.EndReason, "test-end")
 	}
 }
 

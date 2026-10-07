@@ -89,10 +89,16 @@ type Session struct {
 	Members          []Member
 	CreatedTick      int64
 	EndedTick        int64
+	EndReason        string // machine-readable end cause, set exactly once at SessionEnded
 	MatchID          string
 	Backfill         bool   // true if the session was created via backfill
 	BackfillTicketID string // active backfill ticket, if any
-	MessageCount     int64
+	// BackfillSlots is the total number of vacated slots already covered by a
+	// (pending or completed) backfill request. New vacancies are the count of
+	// MemberLeft entries minus BackfillSlots, so a completed backfill never
+	// masks a later vacancy.
+	BackfillSlots int
+	MessageCount  int64
 }
 
 // BackfillTicket requests a replacement team for a vacated session slot.
